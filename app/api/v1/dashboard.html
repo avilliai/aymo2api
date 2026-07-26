@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Aymo2API · 账号管理</title>
+  <style>
+    :root{font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;color:#172033;background:#f4f7fb}
+    *{box-sizing:border-box}body{margin:0}button,input,select,textarea{font:inherit}
+    button{border:1px solid #d7dfeb;background:#fff;color:#24324a;border-radius:8px;padding:9px 13px;cursor:pointer;transition:.15s}
+    button:hover{border-color:#6d83aa;background:#f8fbff}button:disabled{opacity:.52;cursor:not-allowed}
+    button.primary{background:#2563eb;border-color:#2563eb;color:#fff}button.primary:hover{background:#1d4ed8}
+    button.danger{color:#b42318}button.ghost{background:transparent;border-color:transparent}
+    .wrap{max-width:1480px;margin:0 auto;padding:22px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:20px}
+    h1{font-size:25px;margin:0 0 5px}.sub{color:#6c7890;font-size:13px}.actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+    .cards{display:grid;grid-template-columns:repeat(6,minmax(125px,1fr));gap:11px;margin-bottom:18px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:12px;padding:15px;box-shadow:0 2px 8px #1f3b6610}.label{font-size:12px;color:#71809a}.value{font-size:24px;font-weight:650;margin-top:7px}
+    .panel{background:#fff;border:1px solid #e5eaf2;border-radius:12px;box-shadow:0 2px 8px #1f3b660d;margin-bottom:17px;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid #edf1f6}.panel-head h2{font-size:16px;margin:0}.panel-body{padding:15px}
+    .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.toolbar input,.toolbar select,.modal input,.modal select,.modal textarea{border:1px solid #d7dfeb;border-radius:8px;padding:9px 10px;background:#fff;color:#172033}.toolbar input{min-width:225px}
+    .tabs{display:flex;gap:5px;flex-wrap:wrap}.tab{border:0;background:transparent;color:#6c7890;padding:7px 9px;border-radius:7px}.tab.active{background:#eaf1ff;color:#1d4ed8;font-weight:650}.count{display:inline-block;min-width:18px;margin-left:3px;padding:1px 5px;border-radius:99px;background:#eef2f7;font-size:11px;text-align:center}
+    .table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;min-width:1080px}th,td{text-align:left;padding:10px 11px;border-bottom:1px solid #edf1f6;font-size:13px;vertical-align:middle}th{color:#71809a;font-weight:600;background:#fbfcfe;position:sticky;top:0;z-index:1}tr:hover td{background:#fbfdff}.selected td{background:#f7faff}.muted{color:#7d8aa0}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:600}.ok{background:#e8f7ee;color:#087443}.off{background:#f0f2f5;color:#687386}.bad{background:#fff0ef;color:#b42318}.warn{background:#fff6df;color:#996500}.mini{padding:5px 8px;font-size:12px;margin:0 3px 3px 0}.empty{text-align:center;color:#7d8aa0;padding:34px}.error-text{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#b42318}
+    .job{display:flex;align-items:center;gap:11px;flex-wrap:wrap;font-size:13px}.job strong{font-weight:650}.progress{height:8px;min-width:180px;max-width:380px;background:#e9eef7;border-radius:99px;overflow:hidden}.progress i{display:block;height:100%;background:#2563eb;width:0;transition:width .25s}
+    .bulk{display:none;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 15px;background:#f7faff;border-bottom:1px solid #e5edf9;font-size:13px}.bulk.open{display:flex}.bulk .spacer{flex:1}.pager{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 15px;color:#71809a;font-size:12px}.pager-actions{display:flex;gap:5px}.pager button{padding:5px 9px;font-size:12px}
+    .modal-back{display:none;position:fixed;inset:0;background:#0b18334d;align-items:center;justify-content:center;padding:18px;z-index:10}.modal-back.open{display:flex}.modal{background:#fff;width:min(700px,100%);max-height:calc(100vh - 36px);overflow:auto;border-radius:14px;box-shadow:0 20px 60px #0b183333;padding:20px}.modal h3{margin:0 0 14px}.field{display:grid;gap:6px;margin:11px 0}.field label{font-size:12px;color:#66748c}.modal textarea{min-height:180px;resize:vertical}.modal-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.hint{font-size:12px;color:#71809a;line-height:1.6}.toast{position:fixed;right:20px;bottom:20px;display:none;max-width:440px;background:#172033;color:#fff;border-radius:9px;padding:11px 14px;font-size:13px;z-index:20}.toast.show{display:block}.toast.error{background:#b42318}
+    @media(max-width:1100px){.cards{grid-template-columns:repeat(3,minmax(125px,1fr))}.top{flex-direction:column}.actions{justify-content:flex-start}}
+    @media(max-width:620px){.cards{grid-template-columns:repeat(2,minmax(120px,1fr))}.wrap{padding:13px}.panel-head{align-items:flex-start;flex-direction:column}.toolbar input{min-width:180px;width:100%}}
+  </style>
+</head>
+<body>
+<main class="wrap">
+  <header class="top">
+    <div><h1>Aymo2API 账号管理</h1><div class="sub">aymo.ai better-auth 会话、每日额度、代理池与注册任务</div></div>
+    <div class="actions">
+      <button id="configBtn">连接设置</button><button id="reloadBtn">重新加载</button><button id="refreshBtn">刷新额度</button><button id="importBtn">导入账号</button><button class="primary" id="registerBtn">注册账号</button>
+    </div>
+  </header>
+
+  <section class="cards">
+    <div class="card"><div class="label">账号总数</div><div class="value" id="sTotal">0</div></div>
+    <div class="card"><div class="label">当前可用</div><div class="value" id="sAlive">0</div></div>
+    <div class="card"><div class="label">已禁用</div><div class="value" id="sDisabled">0</div></div>
+    <div class="card"><div class="label">耗尽/失效</div><div class="value" id="sExhausted">0</div></div>
+    <div class="card"><div class="label">总剩余额度</div><div class="value" id="sCredits">0</div></div>
+    <div class="card"><div class="label">最近刷新</div><div class="value" id="sChecked" style="font-size:14px;padding-top:5px">—</div></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>注册任务</h2><div class="job"><span id="jobText" class="muted">暂无任务</span><div class="progress"><i id="jobProgress"></i></div><button class="mini" id="jobRefreshBtn">刷新状态</button><button class="mini danger" id="jobStopBtn" disabled>停止任务</button></div></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div class="tabs" id="tabs">
+        <button class="tab active" data-filter="all">全部 <span class="count" id="fAll">0</span></button>
+        <button class="tab" data-filter="alive">可用 <span class="count" id="fAlive">0</span></button>
+        <button class="tab" data-filter="exhausted">耗尽/失效 <span class="count" id="fExhausted">0</span></button>
+        <button class="tab" data-filter="disabled">已禁用 <span class="count" id="fDisabled">0</span></button>
+      </div>
+      <div class="toolbar"><input id="filter" placeholder="按邮箱、用户 ID 搜索"><select id="pageSize"><option value="25">25 条/页</option><option value="50" selected>50 条/页</option><option value="100">100 条/页</option><option value="200">200 条/页</option></select></div>
+    </div>
+    <div class="bulk" id="bulkBar"><strong id="selectedCount">已选 0 项</strong><button class="mini" id="bulkRefresh">刷新</button><button class="mini" id="bulkEnable">启用</button><button class="mini" id="bulkDisable">禁用</button><button class="mini danger" id="bulkDelete">删除</button><span class="spacer"></span><button class="mini ghost" id="clearSelection">清除选择</button></div>
+    <div class="table-wrap"><table><thead><tr><th style="width:38px"><input type="checkbox" id="checkAll" aria-label="全选"></th><th>ID</th><th>邮箱</th><th>用户 ID</th><th>会话</th><th>额度</th><th>状态</th><th>最近检查</th><th>错误</th><th>操作</th></tr></thead><tbody id="rows"><tr><td colspan="10" class="empty">加载中…</td></tr></tbody></table></div>
+    <div class="pager"><span id="pageInfo">—</span><div class="pager-actions"><button id="firstPage">首页</button><button id="prevPage">上一页</button><button id="nextPage">下一页</button><button id="lastPage">末页</button></div></div>
+  </section>
+</main>
+
+<div class="modal-back" id="configModal"><div class="modal"><h3>连接设置</h3><div class="field"><label>API 地址（可填另一台 Aymo2API 实例）</label><input id="baseUrl" placeholder="http://127.0.0.1:8019"></div><div class="field"><label>API Key（仅保存在当前浏览器）</label><input id="apiKey" type="password" autocomplete="off"></div><div class="hint">同源部署时地址留空即可。保存后会立即重新读取账号列表。</div><div class="modal-foot"><button data-close="configModal">取消</button><button class="primary" id="saveConfig">保存</button></div></div></div>
+<div class="modal-back" id="importModal"><div class="modal"><h3>导入账号</h3><div class="hint">每行支持 <span class="mono">email|password|session_token</span>，也支持直接粘贴 JSON 数组。含 cookies、org_id、user_id 等字段时请使用 JSON。<br>session_token 为 <span class="mono">__Secure-better-auth.session_token</span> 的值；只填 email|password 时会在探测阶段自动登录（需要 Turnstile solver）。</div><div class="field"><label>账号内容</label><textarea id="importText" placeholder="user@example.com|PASSWORD|SESSION_TOKEN"></textarea></div><div class="modal-foot"><button data-close="importModal">取消</button><button class="primary" id="doImport">导入并检查</button></div></div></div>
+<div class="modal-back" id="registerModal"><div class="modal"><h3>启动注册任务</h3><div class="field"><label>目标成功账号数</label><input id="regCount" type="number" min="1" value="1"></div><div class="field"><label>可选 Turnstile token（留空则自动调用本地 solver）</label><input id="captchaToken" type="password" autocomplete="off" placeholder="通常留空即可"></div><div class="hint">邮箱 worker 与 Turnstile solver 配置来自服务端环境变量。注册走 better-auth 邮箱验证流程，任务在后台运行；请先用小数量确认邮箱与 solver 配置正常。</div><div class="modal-foot"><button data-close="registerModal">取消</button><button class="primary" id="startRegister">开始</button></div></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  'use strict';
+  const state = {accounts: [], summary: {}, selected: new Set(), filter: 'all', page: 1, pageSize: 50, loading: false, initialized: false};
+  const $ = id => document.getElementById(id);
+  const storage = {base: 'aymo2api_base_url', key: 'aymo2api_api_key'};
+  const on = (id, event, fn) => $(id).addEventListener(event, fn);
+
+  function baseUrl() {
+    const raw = (localStorage.getItem(storage.base) || window.location.origin || '').trim();
+    return (raw || window.location.origin).replace(/\/+$/, '');
+  }
+  function headers(json) {
+    const result = {};
+    const key = localStorage.getItem(storage.key) || '';
+    if (key) result.Authorization = 'Bearer ' + key;
+    if (json) result['Content-Type'] = 'application/json';
+    return result;
+  }
+  async function api(path, options = {}) {
+    const opts = {...options, headers: {...headers(Boolean(options.body)), ...(options.headers || {})}};
+    const response = await fetch(baseUrl() + path, opts);
+    const text = await response.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {raw: text}; }
+    if (!response.ok) throw new Error(data.detail || data.error?.message || data.raw || ('HTTP ' + response.status));
+    return data;
+  }
+  function toast(message, error = false) {
+    const node = $('toast'); node.textContent = message; node.className = 'toast show' + (error ? ' error' : '');
+    clearTimeout(toast.timer); toast.timer = setTimeout(() => { node.className = 'toast'; }, 3600);
+  }
+  function openModal(id) { $(id).classList.add('open'); }
+  function closeModal(id) { $(id).classList.remove('open'); }
+  function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function fmtTime(value) { if (!value) return '—'; const d = new Date(Number(value) * 1000); return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString(); }
+  function alive(a) { return Boolean(a.is_alive) && !a.disabled && Number(a.remaining || 0) > 0; }
+  function filteredAccounts() {
+    const query = ($('filter').value || '').trim().toLowerCase();
+    return state.accounts.filter(a => {
+      if (state.filter === 'alive' && !alive(a)) return false;
+      if (state.filter === 'disabled' && !a.disabled) return false;
+      if (state.filter === 'exhausted' && (alive(a) || a.disabled)) return false;
+      if (!query) return true;
+      return (String(a.email || '') + ' ' + String(a.user_id || '')).toLowerCase().includes(query);
+    });
+  }
+  function renderSummary() {
+    const s = state.summary || {};
+    $('sTotal').textContent = s.total || 0; $('sAlive').textContent = s.alive || 0; $('sDisabled').textContent = s.disabled || 0;
+    $('sExhausted').textContent = s.exhausted || 0; $('sCredits').textContent = s.total_remaining || 0;
+    const latest = state.accounts.reduce((max, a) => Math.max(max, Number(a.last_checked || 0)), 0); $('sChecked').textContent = latest ? fmtTime(latest) : '—';
+    const count = {all: state.accounts.length, alive: state.accounts.filter(alive).length, disabled: state.accounts.filter(a => a.disabled).length, exhausted: state.accounts.filter(a => !alive(a) && !a.disabled).length};
+    $('fAll').textContent = count.all; $('fAlive').textContent = count.alive; $('fDisabled').textContent = count.disabled; $('fExhausted').textContent = count.exhausted;
+  }
+  function render() {
+    const list = filteredAccounts(); const pages = Math.max(1, Math.ceil(list.length / state.pageSize)); state.page = Math.min(state.page, pages);
+    const start = (state.page - 1) * state.pageSize; const visible = list.slice(start, start + state.pageSize); const body = $('rows');
+    if (!visible.length) body.innerHTML = '<tr><td colspan="10" class="empty">暂无匹配账号</td></tr>';
+    else body.innerHTML = visible.map(a => {
+      const isAlive = alive(a); const status = a.disabled ? ['off','已禁用'] : isAlive ? ['ok','可用'] : Number(a.remaining || 0) <= 0 ? ['warn','额度耗尽'] : ['bad','失效'];
+      const checked = state.selected.has(Number(a.index)); const error = a.last_error || '';
+      return `<tr class="${checked ? 'selected' : ''}"><td><input type="checkbox" ${checked ? 'checked' : ''} onchange="window.aymoToggle(${Number(a.index)},this.checked)"></td><td>${Number(a.index)}</td><td>${esc(a.email)}</td><td class="mono">${esc(a.user_id || '—')}</td><td class="mono">${esc(a.token_hint || '—')}</td><td>${Number(a.remaining || 0)}/${Number(a.max_credits || 0) || '—'}</td><td><span class="pill ${status[0]}">${status[1]}</span></td><td class="muted">${esc(fmtTime(a.last_checked))}</td><td class="error-text" title="${esc(error)}">${esc(error || '—')}</td><td><button class="mini" onclick="window.aymoRefresh(${Number(a.index)})">刷新</button><button class="mini" onclick="window.aymoToggleDisabled(${Number(a.index)},${!a.disabled})">${a.disabled ? '启用' : '禁用'}</button><button class="mini danger" onclick="window.aymoDelete(${Number(a.index)})">删除</button></td></tr>`;
+    }).join('');
+    $('pageInfo').textContent = list.length ? `第 ${start + 1}-${Math.min(start + state.pageSize, list.length)} 条，共 ${list.length} 条（第 ${state.page}/${pages} 页）` : '—';
+    $('firstPage').disabled = $('prevPage').disabled = state.page <= 1; $('nextPage').disabled = $('lastPage').disabled = state.page >= pages;
+    $('checkAll').checked = visible.length > 0 && visible.every(a => state.selected.has(Number(a.index))); $('checkAll').indeterminate = visible.some(a => state.selected.has(Number(a.index))) && !$('checkAll').checked;
+    updateBulk();
+  }
+  function updateBulk() { $('selectedCount').textContent = '已选 ' + state.selected.size + ' 项'; $('bulkBar').classList.toggle('open', state.selected.size > 0); }
+  async function loadAccounts(silent = false) {
+    if (state.loading) return; state.loading = true;
+    try { const data = await api('/admin/tokens/detail'); state.accounts = data.tokens || []; state.summary = data.summary || {}; const valid = new Set(state.accounts.map(a => Number(a.index))); state.selected = new Set([...state.selected].filter(i => valid.has(i))); renderSummary(); render(); if (!silent) toast('账号列表已更新'); }
+    catch (e) { if (!silent || !state.initialized) toast(e.message, true); else console.warn(e); }
+    finally { state.initialized = true; state.loading = false; }
+  }
+  async function refreshAll() { try { await api('/admin/tokens/refresh', {method:'POST'}); await loadAccounts(true); toast('额度刷新完成'); } catch(e) { toast(e.message, true); } }
+  async function refreshOne(id) { try { await api('/admin/tokens/' + id + '/refresh', {method:'POST'}); await loadAccounts(true); toast('账号已刷新'); } catch(e) { toast(e.message, true); } }
+  async function toggleDisabled(id, enabled) { try { await api('/admin/tokens/bulk/' + (enabled ? 'enable' : 'disable'), {method:'POST', body:JSON.stringify({indexes:[id]})}); await loadAccounts(true); toast(enabled ? '账号已启用' : '账号已禁用'); } catch(e) { toast(e.message, true); } }
+  async function deleteOne(id) { if (!window.confirm('确定永久删除这个账号吗？')) return; try { await api('/admin/tokens/' + id, {method:'DELETE'}); state.selected.delete(id); await loadAccounts(true); toast('账号已删除'); } catch(e) { toast(e.message, true); } }
+  async function bulk(action) {
+    const ids = [...state.selected]; if (!ids.length) return;
+    if (action === 'delete' && !window.confirm('确定永久删除已选的 ' + ids.length + ' 个账号吗？')) return;
+    try { const path = action === 'delete' ? '/admin/tokens/bulk/delete' : '/admin/tokens/bulk/' + action; await api(path, {method:'POST', body:JSON.stringify({indexes:ids})}); state.selected.clear(); await loadAccounts(true); toast('批量操作完成'); } catch(e) { toast(e.message, true); }
+  }
+  function parseAccounts(raw) {
+    const text = raw.trim(); if (!text) return [];
+    if (text[0] === '[' || text[0] === '{') { const parsed = JSON.parse(text); if (Array.isArray(parsed)) return parsed; if (Array.isArray(parsed.tokens)) return parsed.tokens; return [parsed]; }
+    return text.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => { const p = line.split('|'); return {email:p[0] || '', password:p[1] || '', token:p.slice(2).join('|') || ''}; });
+  }
+  async function importAccounts() { try { const tokens = parseAccounts($('importText').value); if (!tokens.length) throw new Error('没有可导入内容'); await api('/admin/tokens/add', {method:'POST', body:JSON.stringify({tokens})}); $('importText').value = ''; closeModal('importModal'); await loadAccounts(true); toast('账号导入完成'); } catch(e) { toast(e.message, true); } }
+  async function loadJob() {
+    try { const data = await api('/admin/register/status'); const job = data.job || {}; $('jobStopBtn').disabled = !job.running; if (!job.job_id) { $('jobText').textContent = '暂无任务'; $('jobProgress').style.width = '0'; return; } const target = Number(job.target || 0), success = Number(job.success || 0), pct = target ? Math.min(100, success / target * 100) : 0; $('jobProgress').style.width = pct + '%'; $('jobText').textContent = (job.running ? '运行中' : '已结束') + ' · 成功 ' + success + ' / ' + target + ' · 失败 ' + (job.failed || 0) + ' · 尝试 ' + (job.attempts || 0); $('jobText').title = job.last_error || ''; }
+    catch(e) { $('jobText').textContent = '状态读取失败：' + e.message; }
+  }
+  async function stopRegister() { try { await api('/admin/register/stop', {method:'POST'}); await loadJob(); toast('已请求停止注册任务'); } catch(e) { toast(e.message, true); } }
+  async function startRegister() { try { const count = Number($('regCount').value); if (!Number.isInteger(count) || count < 1) throw new Error('目标数量必须是正整数'); const body = {count}; const captcha = $('captchaToken').value.trim(); if (captcha) body.captcha_token = captcha; await api('/admin/register/start', {method:'POST', body:JSON.stringify(body)}); closeModal('registerModal'); await loadJob(); toast('注册任务已启动'); } catch(e) { toast(e.message, true); } }
+  function saveConfig() { const base = $('baseUrl').value.trim().replace(/\/+$/, ''); if (base) localStorage.setItem(storage.base, base); else localStorage.removeItem(storage.base); localStorage.setItem(storage.key, $('apiKey').value.trim()); closeModal('configModal'); loadAccounts(); loadJob(); toast('连接设置已保存'); }
+  function openConfig() { $('baseUrl').value = localStorage.getItem(storage.base) || ''; $('apiKey').value = localStorage.getItem(storage.key) || ''; openModal('configModal'); }
+
+  window.aymoToggle = (id, checked) => { if (checked) state.selected.add(Number(id)); else state.selected.delete(Number(id)); render(); };
+  window.aymoRefresh = refreshOne; window.aymoToggleDisabled = toggleDisabled; window.aymoDelete = deleteOne;
+  on('configBtn','click',openConfig); on('reloadBtn','click',() => loadAccounts()); on('refreshBtn','click',refreshAll); on('importBtn','click',() => openModal('importModal')); on('registerBtn','click',() => openModal('registerModal')); on('saveConfig','click',saveConfig); on('doImport','click',importAccounts); on('startRegister','click',startRegister); on('jobRefreshBtn','click',loadJob); on('jobStopBtn','click',stopRegister); on('bulkRefresh','click',() => bulk('refresh')); on('bulkEnable','click',() => bulk('enable')); on('bulkDisable','click',() => bulk('disable')); on('bulkDelete','click',() => bulk('delete')); on('clearSelection','click',() => {state.selected.clear(); render();});
+  on('filter','input',() => {state.page = 1; render();}); on('pageSize','change',() => {state.pageSize = Number($('pageSize').value) || 50; state.page = 1; render();});
+  on('firstPage','click',() => {state.page = 1; render();}); on('prevPage','click',() => {state.page--; render();}); on('nextPage','click',() => {state.page++; render();}); on('lastPage','click',() => {state.page = Math.ceil(filteredAccounts().length / state.pageSize) || 1; render();});
+  $('tabs').addEventListener('click', event => { const button = event.target.closest('[data-filter]'); if (!button) return; state.filter = button.dataset.filter; state.page = 1; document.querySelectorAll('.tab').forEach(n => n.classList.toggle('active', n === button)); render(); });
+  $('checkAll').addEventListener('change', event => { const visible = filteredAccounts().slice((state.page - 1) * state.pageSize, state.page * state.pageSize); visible.forEach(a => event.target.checked ? state.selected.add(Number(a.index)) : state.selected.delete(Number(a.index))); render(); });
+  document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => closeModal(button.dataset.close)));
+  document.querySelectorAll('.modal-back').forEach(back => back.addEventListener('click', e => { if (e.target === back) closeModal(back.id); }));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') document.querySelectorAll('.modal-back.open').forEach(n => closeModal(n.id)); });
+  loadAccounts(true); loadJob(); setInterval(() => { loadAccounts(true); loadJob(); }, 5000);
+})();
+</script>
+</body>
+</html>

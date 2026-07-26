@@ -1,0 +1,26 @@
+"""Application entry point: ``python main.py`` or ``uvicorn main:app``."""
+
+import logging
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+
+from app.app import create_app
+
+app = create_app()
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8019")),
+        reload=os.getenv("RELOAD", "false").lower() == "true",
+    )

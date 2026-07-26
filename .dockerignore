@@ -1,0 +1,14 @@
+.git
+.idea
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.env
+tests
+data/accounts.json
+data/register-job.json
+data/*.log
+aymo_signup.html
+aymo_headers.txt

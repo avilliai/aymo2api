@@ -1,0 +1,12 @@
+{
+  "running": true,
+  "job_id": "reg_a01d19dfebec",
+  "target": 1000,
+  "success": 5,
+  "failed": 6,
+  "attempts": 12,
+  "last_error": "无法获取注册 Turnstile token",
+  "started_at": 1785068955,
+  "finished_at": null,
+  "stop_requested": false
+}

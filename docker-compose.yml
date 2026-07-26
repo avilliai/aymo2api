@@ -1,0 +1,10 @@
+services:
+  aymo2api:
+    build: .
+    ports:
+      - "${HOST_PORT:-8019}:${PORT:-8019}"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

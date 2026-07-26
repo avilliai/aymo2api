@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.ruff_cache/
+data/accounts.json
+data/register-job.json
+data/*.log
+aymo_signup.html
+aymo_headers.txt
