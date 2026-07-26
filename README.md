@@ -30,10 +30,19 @@ aymo.ai 前端把后端代理在 `https://aymo.ai/backend-api`（即 `https://ba
   每日重置。
 
 ## 快速启动
-
-需要一个本地运行的 **Turnstile solver**（默认 `http://127.0.0.1:5072`，GET
+### turnstile solver
+需要部署一个本地运行的 **[Turnstile solver](https://github.com/D3-vin/Turnstile-Solver-NEW)**（默认 `http://127.0.0.1:5072`，GET
 `/turnstile?url=&sitekey=` → `{taskId}`，GET `/result?id=` → `{solution:{token}}`）；
 或者设置 `YESCAPTCHA_KEY` 走云端打码。
+### temp-mail
+部署[temp-mail](https://temp-mail-docs.awsl.uk/zh/)      
+配置.env中
+```.env
+WORKER_DOMAIN=你的worker地址，如xxxx.xxxx.workers.dev
+EMAIL_DOMAIN=邮箱域名
+ADMIN_PASSWORD=设置的管理员密钥
+```
+
 
 ```powershell
 Copy-Item .env.example .env
@@ -86,7 +95,7 @@ curl http://localhost:8019/v1/chat/completions \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5-nano",
+    "model": "auto",
     "stream": true,
     "messages": [{"role":"user","content":"hello"}]
   }'
