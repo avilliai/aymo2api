@@ -1,8 +1,4 @@
-"""
-FastAPI 应用工厂：负责注册路由、挂载中间件和生命周期管理。
-"""
-
-import asyncio
+﻿import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -11,18 +7,18 @@ from contextlib import suppress
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.services.token_manager import TokenManager
+from app.services.token_manager import token_manager
 from app.api.v1 import chat, models, admin, anthropic
 from app.core.exceptions import register_exception_handlers
 from dotenv import load_dotenv
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── 启动阶段 ──────────────────────────────────────────
-    token_manager = TokenManager(file_path=os.getenv("TOKEN_FILE", "data/accounts.json"))
+    # Startup
     await token_manager.load(refresh=False)
     app.state.token_manager = token_manager
 
@@ -30,10 +26,11 @@ async def lifespan(app: FastAPI):
         keep_alive_minutes = max(1, int(os.getenv("KEEP_ALIVE_MINUTES", "30")))
     except (TypeError, ValueError):
         keep_alive_minutes = 30
+
     startup_refresh_task = None
     if (
         token_manager.tokens
-        and os.getenv("REFRESH_ON_START", "true").lower() in {"1", "true", "yes", "on"}
+        and os.getenv("REFRESH_ON_START", "false").lower() in {"1", "true", "yes", "on"}
     ):
         startup_refresh_task = token_manager._track_background(
             token_manager.refresh_all(), name="AymoStartupRefresh"
@@ -42,10 +39,20 @@ async def lifespan(app: FastAPI):
         token_manager.keep_alive_loop(interval_minutes=keep_alive_minutes)
     )
 
-    logger.info("aymo2api 启动完成")
+    # In Outlook mode, automatically ensure default accounts are available
+    if os.getenv("EMAIL_MODE", "outlook").lower() == "outlook":
+        from app.services.register import register_batch_outlook
+        default_outlook_count = int(os.getenv("DEFAULT_OUTLOOK_ACCOUNTS", "10"))
+        usable = sum(1 for t in token_manager.tokens if not t.get("disabled") and t.get("is_alive"))
+        if usable < default_outlook_count:
+            need = default_outlook_count - usable
+            logger.info("Outlook ????????? (%d/%d)??????????? %d ???...", usable, default_outlook_count, need)
+            token_manager._track_background(register_batch_outlook(count=need), name="AymoStartupOutlookRegister")
+
+    logger.info("aymo2api ??????")
     yield
 
-    # ── 关闭阶段 ──────────────────────────────────────────
+    # Shutdown
     await token_manager.cancel_background()
     if startup_refresh_task is not None:
         if not startup_refresh_task.done():
@@ -56,13 +63,23 @@ async def lifespan(app: FastAPI):
     with suppress(asyncio.CancelledError):
         await keep_alive_task
     await token_manager.flush()
-    logger.info("aymo2api 已关闭。")
+    # In Outlook mode, automatically ensure default accounts are available
+    if os.getenv("EMAIL_MODE", "outlook").lower() == "outlook":
+        from app.services.register import register_batch_outlook
+        default_outlook_count = int(os.getenv("DEFAULT_OUTLOOK_ACCOUNTS", "10"))
+        usable = sum(1 for t in token_manager.tokens if not t.get("disabled") and t.get("is_alive"))
+        if usable < default_outlook_count:
+            need = default_outlook_count - usable
+            logger.info("Outlook ????????? (%d/%d)??????????? %d ???...", usable, default_outlook_count, need)
+            token_manager._track_background(register_batch_outlook(count=need), name="AymoStartupOutlookRegister")
+
+    logger.info("aymo2api ??????")
 
 
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Aymo2API",
-        description="将 aymo.ai 服务包装为 OpenAI 与 Anthropic 兼容 API",
+        description="Aymo.ai to OpenAI and Anthropic compatible API",
         version="1.0.0",
         lifespan=lifespan,
     )

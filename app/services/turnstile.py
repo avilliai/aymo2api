@@ -1,47 +1,50 @@
-"""Cloudflare Turnstile solving via a local solver or YesCaptcha.
-
-The local solver defaults to ``http://127.0.0.1:5072`` and speaks the same
-GET ``/turnstile?url=&sitekey=`` → ``{taskId}`` / GET ``/result?id=`` →
-``{solution:{token}}`` protocol used by the reference notto2api project.
-
-Note: on Windows this environment carries a ghost system proxy that breaks
-localhost requests through httpx.  We force ``trust_env=False`` so the solver
-(and any 127.0.0.1 service) is reached directly.
-"""
+﻿"""Cloudflare Turnstile solving via a remote/local solver or YesCaptcha."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# aymo.ai signup/signin Turnstile widget site key (reverse-engineered).
 AYMO_SITEKEY = os.getenv("AYMO_SITEKEY", "0x4AAAAAACgaobmeaCdcpmsb")
 APP_BASE_URL = os.getenv("AYMO_BASE_URL", "https://aymo.ai").rstrip("/")
+DEFAULT_SOLVER_URL = os.getenv("TURNSTILE_SOLVER_URL", "")
 
 
 class AsyncTurnstileService:
-    """Async Turnstile solver adapter (local solver or YesCaptcha)."""
+    """Async Turnstile solver adapter (local solver, remote solver, or YesCaptcha)."""
 
     def __init__(self, solver_url: str | None = None) -> None:
         self.yescaptcha_key = os.getenv("YESCAPTCHA_KEY", "").strip()
-        self.solver_url = (solver_url or os.getenv("TURNSTILE_SOLVER_URL", "http://127.0.0.1:5072")).rstrip("/")
+        self.solver_url = (solver_url or DEFAULT_SOLVER_URL).rstrip("/")
         self.yescaptcha_api = os.getenv("YESCAPTCHA_API", "https://api.yescaptcha.com")
+        self.proxy = os.getenv("PROXY", "http://127.0.0.1:10809")
+
+    def _get_client_kwargs(self) -> dict[str, Any]:
+        is_local = "127.0.0.1" in self.solver_url or "localhost" in self.solver_url
+        kwargs: dict[str, Any] = {"timeout": 30.0, "verify": False}
+        if is_local:
+            kwargs["trust_env"] = False
+        else:
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+        return kwargs
 
     async def get_turnstile_token(
         self,
         siteurl: str,
         sitekey: str,
-        max_retries: int = 30,
-        initial_delay: int = 5,
+        max_retries: int = 40,
+        initial_delay: int = 2,
         retry_delay: int = 2,
     ) -> str | None:
-        # ``trust_env=False`` avoids the local system proxy hijacking 127.0.0.1.
-        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+        client_kwargs = self._get_client_kwargs()
+        async with httpx.AsyncClient(**client_kwargs) as client:
             try:
                 if self.yescaptcha_key:
                     payload = {
@@ -88,6 +91,6 @@ class AsyncTurnstileService:
 
     async def solve(self, siteurl: str | None = None, sitekey: str | None = None) -> str | None:
         return await self.get_turnstile_token(
-            siteurl or f"{APP_BASE_URL}/signin",
+            siteurl or f"{APP_BASE_URL}/signup",
             sitekey or AYMO_SITEKEY,
         )

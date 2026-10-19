@@ -1,10 +1,13 @@
-"""Aymo.ai account pool: better-auth session persistence and credit tracking.
+﻿"""Aymo.ai account pool: better-auth session persistence, credit tracking and auto-replenishment.
 
-Unlike Clerk (notto2api), aymo.ai uses **better-auth** with an opaque rolling
-session cookie ``__Secure-better-auth.session_token`` rather than a JWT.  There
-is no token-refresh endpoint; when a session expires the only recovery is to
-re-run ``sign-in/email`` (which requires a fresh Turnstile solve).  Credits are
-a per-day allowance surfaced by ``/backend-api/users/me/today-usage``.
+Unlike Clerk, aymo.ai uses better-auth with an opaque rolling session cookie
+`__Secure-better-auth.session_token`. Credits are a per-day allowance surfaced
+by `/backend-api/users/me/today-usage`.
+
+When tokens/credits are exhausted:
+  - Existing accounts are NOT deleted (Aymo credits refresh daily).
+  - Background auto-replenishment registers fresh Outlook accounts.
+  - Active accounts rotate; exhausted accounts remain available for daily quota refresh.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -34,9 +38,7 @@ SESSION_COOKIE = os.getenv("AYMO_SESSION_COOKIE", "__Secure-better-auth.session_
 
 USER_AGENT = os.getenv(
     "AYMO_USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 )
 IMPERSONATE = os.getenv("AYMO_IMPERSONATE", "chrome131")
 
@@ -85,9 +87,9 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on", "y", "是"}:
+    if text in {"1", "true", "yes", "on", "y"}:
         return True
-    if text in {"0", "false", "no", "off", "n", "否", ""}:
+    if text in {"0", "false", "no", "off", "n", ""}:
         return False
     return default
 
@@ -104,7 +106,7 @@ def _cookie_dict(raw: Any) -> dict[str, str]:
 
 
 class TokenManager:
-    """Round-robin aymo.ai account pool with persistent better-auth cookies."""
+    """Round-robin aymo.ai account pool with persistent better-auth cookies and auto-replenishment."""
 
     def __init__(self, file_path: str = "data/accounts.json") -> None:
         self.file_path = Path(file_path)
@@ -117,7 +119,13 @@ class TokenManager:
         self._pending_write_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
 
-    # ── entry construction / persistence ────────────────────────────────
+        # Auto-replenishment settings
+        self.min_standby_threshold = _env_int("MIN_STANDBY_THRESHOLD", 2, 0)
+        self.auto_replenish_batch = _env_int("AUTO_REPLENISH_BATCH", 2, 1)
+        self._replenishing = False
+        self._last_replenish_attempt = 0.0
+        self._replenish_cooldown = _env_int("REPLENISH_COOLDOWN", 60, 10)
+
     def _make_entry(self, item: dict[str, Any]) -> dict[str, Any]:
         raw_cookies = _cookie_dict(item.get("cookies"))
         token = str(
@@ -131,11 +139,13 @@ class TokenManager:
         entry_id = _as_int(item.get("id"), self._next_id, minimum=1)
         self._next_id = max(self._next_id, entry_id + 1)
         credits = item.get("credits", item.get("remaining", 0))
-        max_credits = item.get("max_credits", item.get("maxCredits", 0))
+        max_credits = item.get("max_credits", item.get("maxCredits", 20))
         entry = {
             "id": entry_id,
             "email": str(item.get("email") or "").strip(),
             "password": str(item.get("password") or ""),
+            "client_id": str(item.get("client_id") or ""),
+            "refresh_token": str(item.get("refresh_token") or ""),
             "user_id": str(item.get("user_id") or ""),
             "org_id": str(item.get("org_id") or item.get("organization_id") or ""),
             "session_token": token,
@@ -145,7 +155,16 @@ class TokenManager:
             "tier": str(item.get("tier") or item.get("plan") or "free"),
             "status": str(item.get("status") or "free"),
             "remaining": _as_int(credits, 0, minimum=0),
-            "max_credits": _as_int(max_credits, 0, minimum=0),
+            "max_credits": _as_int(max_credits, 20, minimum=0),
+            "daily_limit": _as_int(item.get("daily_limit"), 20, minimum=0),
+            "daily_used": _as_int(item.get("daily_used"), 0, minimum=0),
+            "daily_remaining": _as_int(item.get("daily_remaining"), _as_int(credits, 0), minimum=0),
+            "monthly_limit": _as_int(item.get("monthly_limit"), 50, minimum=0),
+            "monthly_used": _as_int(item.get("monthly_used"), 0, minimum=0),
+            "monthly_remaining": _as_int(item.get("monthly_remaining"), 50, minimum=0),
+            "credit_reset_date": str(item.get("credit_reset_date") or ""),
+            "extra_credits": _as_int(item.get("extra_credits"), 0, minimum=0),
+            "message_limit": _as_int(item.get("message_limit"), 500, minimum=0),
             "is_alive": _as_bool(item.get("is_alive", item.get("healthy", True)), True),
             "disabled": _as_bool(item.get("disabled", False), False),
             "last_checked": _as_int(item.get("last_checked"), 0, minimum=0),
@@ -161,6 +180,8 @@ class TokenManager:
             "id": entry["id"],
             "email": entry["email"],
             "password": entry["password"],
+            "client_id": entry.get("client_id", ""),
+            "refresh_token": entry.get("refresh_token", ""),
             "user_id": entry.get("user_id", ""),
             "org_id": entry.get("org_id", ""),
             "session_token": entry.get("session_token", ""),
@@ -170,7 +191,7 @@ class TokenManager:
             "tier": entry.get("tier", "free"),
             "status": entry.get("status", "free"),
             "credits": entry.get("remaining", 0),
-            "max_credits": entry.get("max_credits", 0),
+            "max_credits": entry.get("max_credits", 20),
             "is_alive": entry.get("is_alive", True),
             "disabled": entry.get("disabled", False),
             "last_checked": entry.get("last_checked", 0),
@@ -219,7 +240,7 @@ class TokenManager:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                logger.warning("后台账号任务失败: %s", exc)
+                logger.warning("后台任务执行异常: %s", exc)
 
         task.add_done_callback(done)
         return task
@@ -241,7 +262,7 @@ class TokenManager:
             if not isinstance(raw, list):
                 raise ValueError("account file root must be a JSON array")
         except Exception as exc:
-            logger.error("账号文件 %s 解析失败: %s", self.file_path, exc)
+            logger.error("账号文件 %s 加载失败: %s", self.file_path, exc)
             raw = []
 
         seen: set[str] = set()
@@ -273,14 +294,13 @@ class TokenManager:
 
         logger.info("已加载 %d 个 aymo.ai 账号", len(entries))
         should_refresh = (
-            os.getenv("REFRESH_ON_START", "true").lower() in {"1", "true", "yes", "on"}
+            os.getenv("REFRESH_ON_START", "false").lower() in {"1", "true", "yes", "on"}
             if refresh is None
             else bool(refresh)
         )
         if entries and should_refresh:
             await self.refresh_all()
 
-    # ── session helpers ─────────────────────────────────────────────────
     def create_session(self, entry: dict[str, Any], timeout: int = HTTP_TIMEOUT) -> AsyncSession:
         proxy = entry.get("proxy") or os.getenv("PROXY") or None
         session = AsyncSession(impersonate=IMPERSONATE, proxy=proxy, timeout=timeout)
@@ -350,62 +370,6 @@ class TokenManager:
             headers["content-type"] = "application/json"
         return headers
 
-    @staticmethod
-    def _auth_headers(captcha_token: str | None = None) -> dict[str, str]:
-        headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "content-type": "application/json",
-            "origin": APP_BASE_URL,
-            "referer": f"{APP_BASE_URL}/signin",
-            "user-agent": USER_AGENT,
-        }
-        if captcha_token:
-            headers["x-captcha-response"] = captcha_token
-        return headers
-
-    async def _sign_in(self, entry: dict[str, Any], session: AsyncSession) -> bool:
-        """Re-authenticate an account via better-auth sign-in (needs captcha)."""
-        if not entry.get("email") or not entry.get("password"):
-            return False
-        captcha = await AsyncTurnstileService().solve(
-            f"{APP_BASE_URL}/signin", AYMO_SITEKEY
-        )
-        if not captcha:
-            logger.warning("[%s] 无法获取 Turnstile token，跳过重新登录", entry.get("email"))
-            return False
-        response = await session.post(
-            f"{AUTH_BASE}/sign-in/email",
-            json={
-                "email": entry["email"],
-                "password": entry["password"],
-                "rememberMe": True,
-                "callbackURL": f"{APP_BASE_URL}/chats",
-            },
-            headers=self._auth_headers(captcha),
-        )
-        if response.status_code != 200:
-            logger.debug(
-                "[%s] sign-in HTTP %s: %s",
-                entry.get("email"),
-                response.status_code,
-                response.text[:200],
-            )
-            return False
-        self._merge_session_cookies(entry, session)
-        if not entry.get("session_token"):
-            return False
-        try:
-            data = response.json()
-            user = data.get("user") or {}
-            if user.get("id"):
-                entry["user_id"] = str(user["id"])
-        except Exception:
-            pass
-        entry["is_alive"] = True
-        entry["last_error"] = ""
-        return True
-
     async def _get_session_user(self, entry: dict[str, Any], session: AsyncSession) -> dict[str, Any] | None:
         response = await session.get(
             f"{AUTH_BASE}/get-session",
@@ -435,7 +399,10 @@ class TokenManager:
                 data = await self._get_session_user(entry, session)
                 if data:
                     return True
-            return await self._sign_in(entry, session)
+            # If session is invalid, direct sign-in is disabled by aymo upstream
+            # Mark is_alive = False and return False
+            logger.warning("[%s] 会话已失效且不支持直接密码重登", entry.get("email"))
+            return False
 
     async def _fetch_org_id(self, entry: dict[str, Any], session: AsyncSession) -> str:
         response = await session.get(
@@ -455,30 +422,80 @@ class TokenManager:
         return entry.get("org_id", "")
 
     async def _fetch_credits(self, entry: dict[str, Any], session: AsyncSession) -> bool:
-        response = await session.get(
-            f"{BACKEND_API}/users/me/today-usage",
-            headers=self.app_headers(entry, session),
-        )
-        if response.status_code != 200:
-            return False
+        headers = self.app_headers(entry, session)
+        
+        # 1. Fetch daily usage (/backend-api/users/me/today-usage)
+        daily_used, daily_limit = 0, 20
         try:
-            data = response.json().get("data") or {}
-        except Exception:
-            return False
-        used = _as_int(data.get("creditsUsed"), 0, minimum=0)
-        limit = _as_int(data.get("dailyCreditLimit"), 0, minimum=0)
-        entry["max_credits"] = limit
-        entry["remaining"] = max(0, limit - used)
+            response = await session.get(f"{BACKEND_API}/users/me/today-usage", headers=headers)
+            if response.status_code == 200:
+                data = response.json().get("data") or {}
+                daily_used = _as_int(data.get("creditsUsed"), 0, minimum=0)
+                daily_limit = _as_int(data.get("dailyCreditLimit"), 20, minimum=0)
+        except Exception as exc:
+            logger.debug("Failed to fetch today-usage for %s: %s", entry.get("email"), exc)
+
+        daily_remaining = max(0, daily_limit - daily_used)
+
+        # 2. Fetch subscription & monthly quota (/backend-api/subscriptions/current)
+        monthly_limit, monthly_used = 50, 0
+        credit_reset_date = ""
+        message_limit = 500
+        plan_name = "Free"
+        try:
+            sub_resp = await session.get(f"{BACKEND_API}/subscriptions/current", headers=headers)
+            if sub_resp.status_code == 200:
+                sub_data = sub_resp.json() or {}
+                plan = sub_data.get("currentPlan") or {}
+                monthly_limit = _as_int(plan.get("credit_limit"), 50, minimum=0)
+                monthly_used = _as_int(sub_data.get("usageCredits"), 0, minimum=0)
+                credit_reset_date = str(sub_data.get("creditResetDate") or "")
+                message_limit = _as_int(plan.get("message_limit"), 500, minimum=0)
+                plan_name = str(plan.get("name") or "Free")
+                if plan.get("daily_credit_limit") is not None:
+                    daily_limit = _as_int(plan.get("daily_credit_limit"), daily_limit, minimum=0)
+                    daily_remaining = max(0, daily_limit - daily_used)
+        except Exception as exc:
+            logger.debug("Failed to fetch subscription for %s: %s", entry.get("email"), exc)
+
+        monthly_remaining = max(0, monthly_limit - monthly_used)
+
+        # 3. Fetch extra credits (/backend-api/organizations/{orgId}/credits/list)
+        extra_credits = 0
+        org_id = entry.get("org_id")
+        if org_id:
+            try:
+                extra_resp = await session.get(f"{BACKEND_API}/organizations/{org_id}/credits/list", headers=headers)
+                if extra_resp.status_code == 200:
+                    for pkg in (extra_resp.json().get("data") or []):
+                        extra_credits += _as_int(pkg.get("remainingCredits") or pkg.get("credits"), 0, minimum=0)
+            except Exception:
+                pass
+
+        # Effective usable credits today is bounded by daily remaining and monthly remaining
+        effective_remaining = min(daily_remaining, monthly_remaining) + extra_credits
+
+        entry["daily_limit"] = daily_limit
+        entry["daily_used"] = daily_used
+        entry["daily_remaining"] = daily_remaining
+        entry["monthly_limit"] = monthly_limit
+        entry["monthly_used"] = monthly_used
+        entry["monthly_remaining"] = monthly_remaining
+        entry["credit_reset_date"] = credit_reset_date
+        entry["extra_credits"] = extra_credits
+        entry["message_limit"] = message_limit
+        entry["max_credits"] = daily_limit
+        entry["remaining"] = effective_remaining
+        entry["tier"] = plan_name.lower()
         return True
 
-    # ── probing ─────────────────────────────────────────────────────────
     async def _probe_once(self, entry: dict[str, Any]) -> str:
         async with self.create_session(entry, timeout=HTTP_TIMEOUT) as session:
             if not await self.ensure_session(entry, session):
-                raise AuthSessionError("会话失效且无法重新登录")
+                raise AuthSessionError("会话失效")
             await self._fetch_org_id(entry, session)
             if not await self._fetch_credits(entry, session):
-                raise RuntimeError("额度查询失败")
+                raise RuntimeError("配额查询失败")
             entry["is_alive"] = True
             entry["last_checked"] = int(time.time())
             entry["last_error"] = ""
@@ -560,12 +577,58 @@ class TokenManager:
         await self._write_file()
         return entry
 
-    # ── scheduling ──────────────────────────────────────────────────────
+    # ── Auto-replenishment ──────────────────────────────────────────────────
+    def trigger_auto_replenish_if_needed(self) -> None:
+        """Triggers background registration of new Outlook accounts if usable accounts are low."""
+        if not _as_bool(os.getenv("AUTO_REPLENISH", "true"), True):
+            return
+        if self._replenishing:
+            return
+        now = time.time()
+        if now - self._last_replenish_attempt < self._replenish_cooldown:
+            return
+
+        usable_count = sum(
+            1 for entry in self.tokens
+            if not entry["disabled"] and entry["is_alive"] and entry["remaining"] > 0
+        )
+        if usable_count <= self.min_standby_threshold:
+            logger.info(
+                "可用账号数量 (%d) 低于阈值 (%d)，触发后台自动注册新账号...",
+                usable_count,
+                self.min_standby_threshold,
+            )
+            self._track_background(self._auto_replenish_task(), name="AymoAutoReplenish")
+
+    async def _auto_replenish_task(self) -> None:
+        if self._replenishing:
+            return
+        self._replenishing = True
+        self._last_replenish_attempt = time.time()
+        try:
+            from app.services.register import register_batch_outlook
+            logger.info("开始自动注册 %d 个新 Outlook 账号...", self.auto_replenish_batch)
+            new_accounts = await register_batch_outlook(count=self.auto_replenish_batch)
+            logger.info("自动注册完成，新增账号数：%d", len(new_accounts))
+        except Exception as exc:
+            logger.warning("自动注册新账号任务异常: %s", exc)
+        finally:
+            self._replenishing = False
+
+    # ── Scheduling ──────────────────────────────────────────────────────────
     async def get_next(self) -> dict[str, Any]:
+        """Returns the next usable account. Never deletes exhausted accounts; triggers auto-replenish."""
         async with self.lock:
+            # 1. Check if auto-replenish is needed
+            self.trigger_auto_replenish_if_needed()
+
             if not self.tokens:
-                raise HTTPException(status_code=500, detail="账号池为空，请先添加 aymo.ai 账号。")
+                # Trigger auto-replenish if empty
+                self.trigger_auto_replenish_if_needed()
+                raise HTTPException(status_code=500, detail="账号池为空，正在自动注册新账号，请稍后重试。")
+
             total = len(self.tokens)
+            # Find an active account with remaining > 0
             for _ in range(total):
                 entry = self.tokens[self.current_index % total]
                 self.current_index = (self.current_index + 1) % total
@@ -575,14 +638,37 @@ class TokenManager:
                 entry["_inflight"] = _as_int(entry.get("_inflight"), 0) + 1
                 self._schedule_write()
                 return entry
-        raise HTTPException(status_code=429, detail="所有 aymo.ai 账号额度已耗尽或会话失效。")
+
+            # If all accounts are exhausted (remaining <= 0), do NOT delete any accounts!
+            # Old accounts refresh daily. Check if any accounts have refreshed their quota.
+            logger.info("所有账号配额已耗尽，尝试刷新现有账号配额并触发自动注册...")
+            self.trigger_auto_replenish_if_needed()
+
+            # Quickly check if any existing account's daily quota has refreshed
+            for entry in self.tokens:
+                if not entry["disabled"] and entry["is_alive"]:
+                    try:
+                        async with self.create_session(entry, timeout=15) as session:
+                            if await self._fetch_credits(entry, session) and entry["remaining"] > 0:
+                                entry["remaining"] -= 1
+                                entry["_inflight"] = _as_int(entry.get("_inflight"), 0) + 1
+                                self._schedule_write()
+                                logger.info("账号 %s 配额已重置，继续使用！", entry.get("email"))
+                                return entry
+                    except Exception:
+                        pass
+
+        raise HTTPException(
+            status_code=429,
+            detail="所有 aymo.ai 账号当前配额均已耗尽，已触发自动注册新账号，请稍后重试（旧账号次日自动刷新）。"
+        )
 
     def restore_credit(self, entry: dict[str, Any]) -> None:
         inflight = _as_int(entry.get("_inflight"), 0)
         if inflight <= 0:
             return
         entry["_inflight"] = inflight - 1
-        maximum = _as_int(entry.get("max_credits"), 0, minimum=0)
+        maximum = _as_int(entry.get("max_credits"), 20, minimum=0)
         if maximum:
             entry["remaining"] = min(maximum, _as_int(entry.get("remaining"), 0) + 1)
             self._schedule_write()
@@ -609,19 +695,18 @@ class TokenManager:
         if isinstance(entry.get("cookies"), dict):
             entry["cookies"].pop(SESSION_COOKIE, None)
         entry["last_error"] = str(error or "session invalidated")
-        entry["is_alive"] = True
+        entry["is_alive"] = False
         self._schedule_write()
 
     def _by_id(self, token_id: int) -> dict[str, Any] | None:
         return next((entry for entry in self.tokens if entry["id"] == token_id), None)
 
-    # ── mutation ────────────────────────────────────────────────────────
     async def add(
         self,
         items: list[dict[str, Any]],
         *,
-        probe: bool = True,
-        wait_for_probe: bool = True,
+        probe: bool = False,
+        wait_for_probe: bool = False,
     ) -> dict[str, int | bool]:
         existing = {entry["email"].lower() for entry in self.tokens if entry.get("email")}
         new_entries: list[dict[str, Any]] = []
@@ -638,10 +723,10 @@ class TokenManager:
             await self._write_file()
             if probe:
                 if wait_for_probe:
-                    await self._run_refresh(new_entries, "新增账号探测")
+                    await self._run_refresh(new_entries, "新账号探测")
                 else:
                     self._track_background(
-                        self._run_refresh(new_entries, "新增账号探测"),
+                        self._run_refresh(new_entries, "新账号探测"),
                         name="AymoNewAccountProbe",
                     )
         result: dict[str, int | bool] = {
@@ -726,7 +811,16 @@ class TokenManager:
                     "token_hint": f"...{token[-8:]}" if len(token) > 8 else token,
                     "is_alive": entry["is_alive"] and not entry["disabled"],
                     "remaining": entry["remaining"],
-                    "max_credits": entry.get("max_credits", 0),
+                    "max_credits": entry.get("max_credits", 20),
+                    "daily_limit": entry.get("daily_limit", 20),
+                    "daily_used": entry.get("daily_used", 0),
+                    "daily_remaining": entry.get("daily_remaining", entry["remaining"]),
+                    "monthly_limit": entry.get("monthly_limit", 50),
+                    "monthly_used": entry.get("monthly_used", 0),
+                    "monthly_remaining": entry.get("monthly_remaining", 50),
+                    "credit_reset_date": entry.get("credit_reset_date", ""),
+                    "extra_credits": entry.get("extra_credits", 0),
+                    "message_limit": entry.get("message_limit", 500),
                     "tier": entry.get("tier", "free"),
                     "status": entry.get("status", "free"),
                     "disabled": entry["disabled"],
@@ -739,4 +833,11 @@ class TokenManager:
     async def keep_alive_loop(self, interval_minutes: int = 30) -> None:
         while True:
             await asyncio.sleep(max(1, interval_minutes) * 60)
-            await self.refresh_all()
+            try:
+                await self.refresh_all()
+            except Exception as exc:
+                logger.error("keep_alive_loop 异常: %s", exc)
+
+
+# Module-level default instance
+token_manager = TokenManager()
