@@ -346,7 +346,20 @@ async def stream_chat(
             manager.commit_credit(account)
             reservation_settled = True
         except Exception as exc:
-            refund_reservation()
+            is_credit_exhausted = (
+                isinstance(exc, AymoUpstreamError) and (
+                    exc.status_code == 429 or
+                    "credit limit exceeded" in str(exc).lower() or
+                    "daily credit limit" in str(exc).lower()
+                )
+            ) or ("credit limit exceeded" in str(exc).lower())
+            
+            if is_credit_exhausted:
+                # 每日配额耗尽，不可返还预扣额度，直接将该账号标记为 0 并触发补充新账号
+                reservation_settled = True
+                manager.notify_credit_exhausted(account, str(exc))
+            else:
+                refund_reservation()
             if isinstance(exc, AymoUpstreamError) and exc.status_code == 401:
                 manager.invalidate_session(account, exc)
             manager.mark_request_error(account, exc)

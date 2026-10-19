@@ -1,4 +1,4 @@
-﻿"""Aymo.ai account pool: better-auth session persistence, credit tracking and auto-replenishment.
+"""Aymo.ai account pool: better-auth session persistence, credit tracking and auto-replenishment.
 
 Unlike Clerk, aymo.ai uses better-auth with an opaque rolling session cookie
 `__Secure-better-auth.session_token`. Credits are a per-day allowance surfaced
@@ -121,10 +121,13 @@ class TokenManager:
 
         # Auto-replenishment settings
         self.min_standby_threshold = _env_int("MIN_STANDBY_THRESHOLD", 2, 0)
-        self.auto_replenish_batch = _env_int("AUTO_REPLENISH_BATCH", 2, 1)
+        self.active_pool_target = _env_int("ACTIVE_POOL_TARGET", 5, 1)
+        self.auto_replenish_batch = _env_int("AUTO_REPLENISH_BATCH", 1, 1)
         self._replenishing = False
+        self._replenish_lock = asyncio.Lock()
         self._last_replenish_attempt = 0.0
-        self._replenish_cooldown = _env_int("REPLENISH_COOLDOWN", 60, 10)
+        self._replenish_cooldown = _env_int("REPLENISH_COOLDOWN", 5, 1)
+        self._all_outlooks_exhausted = False
 
     def _make_entry(self, item: dict[str, Any]) -> dict[str, Any]:
         raw_cookies = _cookie_dict(item.get("cookies"))
@@ -578,42 +581,67 @@ class TokenManager:
         return entry
 
     # ── Auto-replenishment ──────────────────────────────────────────────────
+    def notify_credit_exhausted(self, entry: dict[str, Any], reason: str = "") -> None:
+        """Called when an upstream request returns 429 Daily credit limit exceeded."""
+        entry["remaining"] = 0
+        entry["daily_remaining"] = 0
+        entry["last_error"] = reason or "Daily credit limit exceeded"
+        self._schedule_write()
+        logger.warning("[%s] 账号配额耗尽，立即触发补充 1 个新账号进活跃池...", entry.get("email"))
+        self.trigger_auto_replenish(needed_count=1)
+
     def trigger_auto_replenish_if_needed(self) -> None:
-        """Triggers background registration of new Outlook accounts if usable accounts are low."""
-        if not _as_bool(os.getenv("AUTO_REPLENISH", "true"), True):
+        """Triggers background registration if usable accounts are below threshold."""
+        if not _as_bool(os.getenv("AUTO_REPLENISH", "true"), True) or self._all_outlooks_exhausted:
+            return
+        usable_count = sum(
+            1 for entry in self.tokens
+            if not entry["disabled"] and entry["is_alive"] and entry["remaining"] > 0
+        )
+        if usable_count < self.active_pool_target:
+            needed = max(1, self.active_pool_target - usable_count)
+            self.trigger_auto_replenish(needed_count=needed)
+
+    def trigger_auto_replenish(self, needed_count: int = 1) -> None:
+        """Immediately trigger background replenishment for needed_count accounts."""
+        if not _as_bool(os.getenv("AUTO_REPLENISH", "true"), True) or self._all_outlooks_exhausted:
             return
         if self._replenishing:
             return
         now = time.time()
         if now - self._last_replenish_attempt < self._replenish_cooldown:
             return
+        self._track_background(self._auto_replenish_task(count=needed_count), name="AymoAutoReplenish")
 
-        usable_count = sum(
-            1 for entry in self.tokens
-            if not entry["disabled"] and entry["is_alive"] and entry["remaining"] > 0
-        )
-        if usable_count <= self.min_standby_threshold:
-            logger.info(
-                "可用账号数量 (%d) 低于阈值 (%d)，触发后台自动注册新账号...",
-                usable_count,
-                self.min_standby_threshold,
-            )
-            self._track_background(self._auto_replenish_task(), name="AymoAutoReplenish")
-
-    async def _auto_replenish_task(self) -> None:
+    async def _auto_replenish_task(self, count: int = 1) -> None:
         if self._replenishing:
             return
-        self._replenishing = True
-        self._last_replenish_attempt = time.time()
-        try:
-            from app.services.register import register_batch_outlook
-            logger.info("开始自动注册 %d 个新 Outlook 账号...", self.auto_replenish_batch)
-            new_accounts = await register_batch_outlook(count=self.auto_replenish_batch)
-            logger.info("自动注册完成，新增账号数：%d", len(new_accounts))
-        except Exception as exc:
-            logger.warning("自动注册新账号任务异常: %s", exc)
-        finally:
-            self._replenishing = False
+        async with self._replenish_lock:
+            self._replenishing = True
+            self._last_replenish_attempt = time.time()
+            try:
+                from app.services.register import register_batch_outlook
+                from app.services.outlook_email_service import OutlookEmailService
+
+                svc = OutlookEmailService()
+                existing_emails = {entry["email"].lower() for entry in self.tokens if entry.get("email")}
+                candidates = svc.get_candidate_accounts(count=1, exclude_emails=existing_emails)
+                if not candidates:
+                    self._all_outlooks_exhausted = True
+                    logger.info("所有 Outlook 邮箱已全部注册使用完毕，切换为已有账号池轮询模式。")
+                    return
+
+                batch_to_register = max(1, count)
+                logger.info("触发动态补充：%d 个新账号进活跃池...", batch_to_register)
+                new_accounts = await register_batch_outlook(count=batch_to_register)
+                logger.info("动态补充完成，成功新增账号数：%d", len(new_accounts))
+                if not new_accounts and not svc.get_candidate_accounts(count=1, exclude_emails=existing_emails):
+                    self._all_outlooks_exhausted = True
+                    logger.info("所有 Outlook 邮箱已注册使用完毕，切换为已有账号池轮询模式。")
+            except Exception as exc:
+                logger.warning("自动补充新账号任务异常: %s", exc)
+            finally:
+                self._replenishing = False
 
     # ── Scheduling ──────────────────────────────────────────────────────────
     async def get_next(self) -> dict[str, Any]:
@@ -637,6 +665,12 @@ class TokenManager:
                 entry["remaining"] -= 1
                 entry["_inflight"] = _as_int(entry.get("_inflight"), 0) + 1
                 self._schedule_write()
+                # 消耗一个账号，若剩余额度归零或可用数偏低，立即触发补充 1 个新账号进池
+                if entry["remaining"] <= 0:
+                    logger.info("[%s] 账号额度已耗尽 (remaining=0)，立即触发自动补充新账号...", entry.get("email"))
+                    self.trigger_auto_replenish(needed_count=1)
+                else:
+                    self.trigger_auto_replenish_if_needed()
                 return entry
 
             # If all accounts are exhausted (remaining <= 0), do NOT delete any accounts!

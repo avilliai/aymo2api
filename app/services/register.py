@@ -1,4 +1,4 @@
-﻿"""aymo.ai account registration via better-auth + Turnstile (Outlook and Worker modes).
+"""aymo.ai account registration via better-auth + Turnstile (Outlook and Worker modes).
 
 Flow:
   1. Obtain email mailbox (Outlook OAuth/IMAP or disposable EmailService)
@@ -37,6 +37,7 @@ from app.services.outlook_email_service import (
     OutlookEmailService,
     get_folder_highest_uids,
     wait_for_outlook_verify_link,
+    wait_for_outlook_otp_code,
 )
 from app.services.turnstile import AYMO_SITEKEY, AsyncTurnstileService
 
@@ -233,6 +234,147 @@ async def register_account(
         }
 
 
+async def sign_in_outlook_account(
+    record: dict[str, str],
+    proxy: str | None = None,
+    captcha_token: str | None = None,
+) -> dict[str, Any]:
+    """Sign in an existing Aymo account via Outlook OTP verification."""
+    email = record["email"]
+    password = record.get("password") or ""
+    client_id = record["client_id"]
+    refresh_token = record["refresh_token"]
+
+    proxy = proxy or os.getenv("PROXY") or None
+    try:
+        poll_timeout = max(30, int(os.getenv("POLL_TIMEOUT", "120")))
+    except (TypeError, ValueError):
+        poll_timeout = 120
+    try:
+        poll_interval = max(1, int(os.getenv("POLL_INTERVAL", "3")))
+    except (TypeError, ValueError):
+        poll_interval = 3
+
+    # 1) Get folder baseline UIDs before requesting sign-in OTP
+    baseline = await asyncio.to_thread(get_folder_highest_uids, email, client_id, refresh_token)
+    logger.info("[%s] Outlook IMAP baseline UIDs (登录): %s", email, baseline)
+
+    solver = AsyncTurnstileService()
+    cf_token1 = captcha_token or await solver.solve(f"{APP_BASE_URL}/signin", AYMO_SITEKEY)
+    if not cf_token1:
+        raise RegistrationError(f"Turnstile 登录 Step 1 验证码求解失败 ({email})")
+
+    random_ip = f"{random.randint(20, 220)}.{random.randint(1, 254)}.{random.randint(1, 254)}.{random.randint(1, 254)}"
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "origin": APP_BASE_URL,
+        "referer": f"{APP_BASE_URL}/signin",
+        "user-agent": USER_AGENT,
+        "x-captcha-response": cf_token1,
+        "x-forwarded-for": random_ip,
+        "x-real-ip": random_ip,
+    }
+
+    async with AsyncSession(impersonate=IMPERSONATE, proxy=proxy, timeout=90) as session:
+        # Step 1: POST email and password
+        step1_resp = await session.post(
+            f"{AUTH_BASE}/sign-in/email-password-step1",
+            json={"email": email, "password": password},
+            headers=headers,
+        )
+        if step1_resp.status_code not in (200, 201):
+            raise RegistrationError(f"登录 Step 1 失败 HTTP {step1_resp.status_code}: {step1_resp.text[:300]}")
+
+        # Step 2: Poll OTP code from mailbox
+        logger.info("[%s] 等待 Outlook 登录验证码 (OTP)...", email)
+        otp = await wait_for_outlook_otp_code(
+            email,
+            client_id,
+            refresh_token,
+            baseline_folders=baseline,
+            timeout=poll_timeout,
+            interval=poll_interval,
+        )
+        if not otp:
+            raise RegistrationError(f"未能获取到 Outlook 登录验证码 ({email})")
+
+        # Step 3: Solve Turnstile token for Step 2
+        cf_token2 = await solver.solve(f"{APP_BASE_URL}/signin", AYMO_SITEKEY)
+        if not cf_token2:
+            raise RegistrationError(f"Turnstile 登录 Step 2 求解失败 ({email})")
+
+        headers["x-captcha-response"] = cf_token2
+        step2_resp = await session.post(
+            f"{AUTH_BASE}/sign-in/email-password-step2",
+            json={"email": email, "otp": otp, "callbackURL": f"{APP_BASE_URL}/chats"},
+            headers=headers,
+        )
+        if step2_resp.status_code not in (200, 201):
+            raise RegistrationError(f"登录 Step 2 失败 HTTP {step2_resp.status_code}: {step2_resp.text[:300]}")
+
+        cookies = session.cookies.get_dict()
+        session_token = cookies.get(SESSION_COOKIE, "")
+        if not session_token:
+            raise RegistrationError(f"登录后未取得 {SESSION_COOKIE} 会话 cookie")
+
+        user_id = ""
+        try:
+            user_id = str((step2_resp.json().get("user") or {}).get("id") or "")
+        except Exception:
+            pass
+
+        # Step 4: Fetch org id + credits
+        common = {
+            "accept": "*/*",
+            "user-agent": USER_AGENT,
+            "origin": APP_BASE_URL,
+            "referer": f"{APP_BASE_URL}/chats",
+        }
+        org_id = ""
+        try:
+            org_resp = await session.get(f"{BACKEND_API}/organizations", headers=common)
+            data = (org_resp.json().get("data") or []) if org_resp.status_code == 200 else []
+            if data:
+                org_id = str(data[0].get("id") or "")
+        except Exception:
+            pass
+
+        remaining, max_credits = 20, 20
+        try:
+            usage_resp = await session.get(f"{BACKEND_API}/users/me/today-usage", headers=common)
+            if usage_resp.status_code == 200:
+                usage = usage_resp.json().get("data") or {}
+                max_credits = int(usage.get("dailyCreditLimit") or 20)
+                remaining = max(0, max_credits - int(usage.get("creditsUsed") or 0))
+        except Exception:
+            pass
+
+        OutlookEmailService().mark_email_used(
+            email,
+            status="registered",
+            extra={"user_id": user_id, "org_id": org_id, "signed_in_at": int(time.time())},
+        )
+
+        return {
+            "email": email,
+            "password": password,
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "user_id": user_id,
+            "org_id": org_id,
+            "session_token": session_token,
+            "cookies": cookies,
+            "inbox_token": "",
+            "proxy": proxy or "",
+            "tier": "free",
+            "status": "free",
+            "credits": remaining,
+            "max_credits": max_credits,
+            "is_alive": True,
+        }
+
 async def register_outlook_account(
     record: dict[str, str],
     proxy: str | None = None,
@@ -290,7 +432,11 @@ async def register_outlook_account(
             headers=signup_headers,
         )
         if resp.status_code not in (200, 201):
-            raise RegistrationError(f"注册请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
+            body_snippet = resp.text[:300]
+            if resp.status_code == 422 and ("EMAIL_ALREADY_EXISTS" in body_snippet or "already exists" in body_snippet.lower()):
+                logger.info("[%s] 邮箱已在 Aymo 注册 (EMAIL_ALREADY_EXISTS)，直接执行登录流程...", email)
+                return await sign_in_outlook_account(record, proxy=proxy)
+            raise RegistrationError(f"注册请求失败 HTTP {resp.status_code}: {body_snippet}")
 
         user_id = ""
         try:
@@ -388,31 +534,29 @@ async def register_batch_outlook(count: int = 10, concurrency: int = 1) -> list[
         existing_emails = {entry["email"].lower() for entry in token_manager.tokens if entry.get("email")}
         candidates = svc.get_candidate_accounts(count=count - len(registered), exclude_emails=existing_emails)
         if not candidates:
-            logger.warning("??????? Outlook ??????")
+            logger.info("所有可用 Outlook 邮箱已注册使用完毕，切换为现有账号池轮询模式。")
             break
 
         for rec in candidates:
             if len(registered) >= count:
                 break
             email = rec["email"]
-            logger.info("???? Outlook ?? (%d/%d): %s ...", len(registered) + 1, count, email)
+            logger.info("处理 Outlook 账号 (%d/%d): %s ...", len(registered) + 1, count, email)
             try:
                 account = await register_outlook_account(rec, proxy=proxy)
                 await token_manager.add([account], probe=False)
                 registered.append(account)
-                logger.info("Outlook ?? %s ??????????%d (??: %d/%d)", email, account.get("credits", 0), len(registered), count)
-                await asyncio.sleep(3)
+                logger.info("Outlook 账号 %s 成功加入活跃池，当前额度：%d (新增进度: %d/%d)", email, account.get("credits", 0), len(registered), count)
+                await asyncio.sleep(2)
             except Exception as exc:
                 err_msg = str(exc)
-                logger.error("Outlook ?? %s ????: %s", email, err_msg)
-                if "EMAIL_ALREADY_EXISTS" in err_msg:
-                    svc.mark_email_used(email, status="already_registered", extra={"error": err_msg})
-                elif "429" in err_msg:
-                    logger.warning("?? 429 ??????? 15 ??????...")
+                logger.error("Outlook 账号 %s 注册/登录失败: %s", email, err_msg)
+                if "429" in err_msg:
+                    logger.warning("遇到 429 频率限制，等待 15 秒后重试下一候选账号...")
                     await asyncio.sleep(15)
                 else:
                     svc.mark_email_used(email, status="failed", extra={"error": err_msg})
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
 
     return registered
 
