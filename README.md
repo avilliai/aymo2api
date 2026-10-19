@@ -51,8 +51,8 @@ pip install -r requirements.txt
 python main.py
 ```
 
-默认监听 `http://127.0.0.1:8019`（可通过 `PORT` 修改）。管理面板地址为
-`http://127.0.0.1:8019/admin/dashboard`。
+默认监听 `http://127.0.0.1:8016`（可通过 `PORT` 修改）。管理面板地址为
+`http://127.0.0.1:8016/admin/dashboard`。
 
 Docker：
 
@@ -91,7 +91,7 @@ docker compose up -d --build
 ## OpenAI 示例
 
 ```bash
-curl http://localhost:8019/v1/chat/completions \
+curl http://localhost:8016/v1/chat/completions \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -112,7 +112,7 @@ curl http://localhost:8019/v1/chat/completions \
 ## Anthropic 示例（含 Claude Code CLI）
 
 ```bash
-curl http://localhost:8019/v1/messages \
+curl http://localhost:8016/v1/messages \
   -H "x-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -142,15 +142,15 @@ TURNSTILE_SOLVER_URL=http://127.0.0.1:5072
 启动任务：
 
 ```bash
-curl -X POST http://localhost:8019/admin/register/start \
+curl -X POST http://localhost:8016/admin/register/start \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"count":1}'
 
-curl http://localhost:8019/admin/register/status \
+curl http://localhost:8016/admin/register/status \
   -H "Authorization: Bearer YOUR_API_KEY"
 
-curl -X POST http://localhost:8019/admin/register/stop \
+curl -X POST http://localhost:8016/admin/register/stop \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
