@@ -43,32 +43,6 @@ USER_AGENT = os.getenv(
 IMPERSONATE = os.getenv("AYMO_IMPERSONATE", "chrome131")
 
 
-def _env_int(name: str, default: int, minimum: int | None = None) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, value) if minimum is not None else value
-
-
-def _env_float(name: str, default: float, minimum: float | None = None) -> float:
-    try:
-        value = float(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, value) if minimum is not None else value
-
-
-REFRESH_CONCURRENCY = _env_int("REFRESH_CONCURRENCY", 5, 1)
-MAX_PROBE_RETRIES = _env_int("MAX_PROBE_RETRIES", 2, 1)
-PROBE_RETRY_DELAY = _env_float("PROBE_RETRY_DELAY", 1.0, 0.1)
-HTTP_TIMEOUT = _env_int("UPSTREAM_TIMEOUT", 120, 10)
-
-
-class AuthSessionError(RuntimeError):
-    """Raised when an account cannot obtain a usable aymo.ai session."""
-
-
 def _as_int(value: Any, default: int = 0, *, minimum: int | None = None) -> int:
     try:
         parsed = int(float(value)) if value not in (None, "") else default
@@ -92,6 +66,33 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if text in {"0", "false", "no", "off", "n", ""}:
         return False
     return default
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value) if minimum is not None else value
+
+
+def _env_float(name: str, default: float, minimum: float | None = None) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value) if minimum is not None else value
+
+
+REFRESH_CONCURRENCY = _env_int("REFRESH_CONCURRENCY", 5, 1)
+MAX_PROBE_RETRIES = _env_int("MAX_PROBE_RETRIES", 2, 1)
+PROBE_RETRY_DELAY = _env_float("PROBE_RETRY_DELAY", 1.0, 0.1)
+HTTP_TIMEOUT = _env_int("UPSTREAM_TIMEOUT", 120, 10)
+KEEP_ALIVE_ENABLED = _as_bool(os.getenv("KEEP_ALIVE_ENABLED", "false"), False)
+
+
+class AuthSessionError(RuntimeError):
+    """Raised when an account cannot obtain a usable aymo.ai session."""
 
 
 def _cookie_dict(raw: Any) -> dict[str, str]:
@@ -389,6 +390,57 @@ class TokenManager:
         self._merge_session_cookies(entry, session)
         return data
 
+    async def relogin_entry(self, entry: dict[str, Any]) -> bool:
+        """Re-login an account via Outlook OTP verification to recover expired sessions."""
+        email = entry.get("email", "").strip()
+        if not email:
+            return False
+
+        # Ensure credentials
+        client_id = entry.get("client_id")
+        refresh_token = entry.get("refresh_token")
+        if not client_id or not refresh_token:
+            from app.services.outlook_email_service import OutlookEmailService
+            svc = OutlookEmailService()
+            found = svc.get_account_by_email(email)
+            if found:
+                entry["client_id"] = found["client_id"]
+                entry["refresh_token"] = found["refresh_token"]
+                if not entry.get("password"):
+                    entry["password"] = found.get("password", "")
+                client_id = found["client_id"]
+                refresh_token = found["refresh_token"]
+
+        if not client_id or not refresh_token:
+            logger.warning("[%s] 缺少 Outlook OAuth 凭证，无法执行邮箱 OTP 重登", email)
+            return False
+
+        try:
+            from app.services.register import sign_in_outlook_account
+            logger.info("[%s] 开始通过 Outlook 邮箱 OTP 验证码重新登录并恢复会话...", email)
+            proxy = entry.get("proxy") or os.getenv("PROXY") or None
+            acc_data = await sign_in_outlook_account(entry, proxy=proxy)
+
+            # Update entry with fresh session and credits
+            entry["session_token"] = acc_data.get("session_token", "")
+            entry["cookies"] = acc_data.get("cookies", {})
+            entry["user_id"] = acc_data.get("user_id") or entry.get("user_id", "")
+            entry["org_id"] = acc_data.get("org_id") or entry.get("org_id", "")
+            credits_val = acc_data.get("credits", 20)
+            entry["remaining"] = credits_val
+            entry["daily_remaining"] = credits_val
+            entry["max_credits"] = acc_data.get("max_credits", 20)
+            entry["is_alive"] = True
+            entry["last_error"] = ""
+            entry["last_checked"] = int(time.time())
+            self._schedule_write()
+            logger.info("[%s] 邮箱重新登录成功，会话恢复！当前额度：%d", email, credits_val)
+            return True
+        except Exception as exc:
+            entry["last_error"] = f"邮箱重登异常: {exc}"
+            logger.warning("[%s] 邮箱 OTP 重新登录失败: %s", email, exc)
+            return False
+
     async def ensure_session(
         self,
         entry: dict[str, Any],
@@ -402,9 +454,15 @@ class TokenManager:
                 data = await self._get_session_user(entry, session)
                 if data:
                     return True
-            # If session is invalid, direct sign-in is disabled by aymo upstream
-            # Mark is_alive = False and return False
-            logger.warning("[%s] 会话已失效且不支持直接密码重登", entry.get("email"))
+
+            logger.info("[%s] 会话已失效(401或过期)，尝试通过 Outlook 邮箱登录自愈重启...", entry.get("email"))
+            ok = await self.relogin_entry(entry)
+            if ok:
+                self._apply_cookies(session, entry.get("cookies", {}))
+                return True
+
+            entry["is_alive"] = False
+            self._schedule_write()
             return False
 
     async def _fetch_org_id(self, entry: dict[str, Any], session: AsyncSession) -> str:
@@ -643,6 +701,21 @@ class TokenManager:
             finally:
                 self._replenishing = False
 
+    async def try_reactivate_accounts(self, count: int = 1) -> list[dict[str, Any]]:
+        """Re-activate accounts that are dead or credit exhausted by re-logging in via Outlook OTP."""
+        reactivated = []
+        dead_or_exhausted = [
+            e for e in self.tokens
+            if not e["disabled"] and (not e["is_alive"] or e["remaining"] <= 0) and e.get("email")
+        ]
+        for entry in dead_or_exhausted:
+            if len(reactivated) >= count:
+                break
+            ok = await self.relogin_entry(entry)
+            if ok and entry["remaining"] > 0:
+                reactivated.append(entry)
+        return reactivated
+
     # ── Scheduling ──────────────────────────────────────────────────────────
     async def get_next(self) -> dict[str, Any]:
         """Returns the next usable account. Never deletes exhausted accounts; triggers auto-replenish."""
@@ -678,7 +751,24 @@ class TokenManager:
             logger.info("所有账号配额已耗尽，尝试刷新现有账号配额并触发自动注册...")
             self.trigger_auto_replenish_if_needed()
 
-            # Quickly check if any existing account's daily quota has refreshed
+            # 1. 首先尝试通过邮箱登录重启池中因会话过期或额度耗尽的已有账号
+            for entry in self.tokens:
+                if not entry["disabled"] and (not entry["is_alive"] or entry["remaining"] <= 0):
+                    email = entry.get("email")
+                    if email and ("outlook" in email.lower() or entry.get("refresh_token")):
+                        logger.info("[%s] 轮询器尝试通过邮箱 OTP 重登重启该失效/额度耗尽账号...", email)
+                        try:
+                            ok = await self.relogin_entry(entry)
+                            if ok and entry["remaining"] > 0:
+                                entry["remaining"] -= 1
+                                entry["_inflight"] = _as_int(entry.get("_inflight"), 0) + 1
+                                self._schedule_write()
+                                logger.info("[%s] 账号成功通过邮箱重登重启！当前可用额度：%d", email, entry["remaining"])
+                                return entry
+                        except Exception as e:
+                            logger.debug("[%s] 重启尝试异常: %s", email, e)
+
+            # 2. 检查现有仍存活账号是否有次日重置额度
             for entry in self.tokens:
                 if not entry["disabled"] and entry["is_alive"]:
                     try:
@@ -865,10 +955,23 @@ class TokenManager:
         return result
 
     async def keep_alive_loop(self, interval_minutes: int = 30) -> None:
+        if not KEEP_ALIVE_ENABLED:
+            logger.info("批量保活已彻底关闭 (KEEP_ALIVE_ENABLED=false)，杜绝批量封号，账号采用按需被动探活机制。")
+            while True:
+                await asyncio.sleep(3600)
+
+        logger.warning("警告：批量保活已开启，为避免批量封号，将采用单账号温和探测而非批量并发轰炸。")
         while True:
-            await asyncio.sleep(max(1, interval_minutes) * 60)
+            await asyncio.sleep(max(5, interval_minutes) * 60)
             try:
-                await self.refresh_all()
+                # 仅对少量活跃账号进行温和单线程探活，绝不并发批量请求
+                alive_tokens = [e for e in self.tokens if not e["disabled"] and e["is_alive"]]
+                for entry in alive_tokens[:3]:
+                    try:
+                        await self._probe(entry)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(5)
             except Exception as exc:
                 logger.error("keep_alive_loop 异常: %s", exc)
 

@@ -15,7 +15,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-STATUS_FILE = Path("data/outlook_usage.json")
+STATUS_FILE = Path(os.getenv("OUTLOOK_STATUS_FILE", "data/outlook_usage.json"))
 
 @dataclass
 class OutlookInbox:
@@ -135,13 +135,13 @@ def check_folder_for_verify_link(c: imaplib.IMAP4_SSL, folder: str, after_id: in
                 m = re.search(r'https?://[^\s"\'<>]*?/auth/verify-email\?[^\s"\'<>]+', decoded, re.I)
                 if m:
                     return html.unescape(m.group(0))
-    except Exception as e:
-        logger.debug("check_folder_for_verify_link error in %s: %s", folder, e)
+    except Exception:
+        pass
     return None
 
 
 def check_folder_for_otp_code(c: imaplib.IMAP4_SSL, folder: str, after_id: int = 0) -> str | None:
-    """Inspects folder messages with ID > after_id for Aymo 6-digit OTP code."""
+    """Inspects folder messages with ID > after_id for Aymo sign-in 6-digit OTP code."""
     try:
         typ, _ = c.select(folder, readonly=True)
         if typ != "OK":
@@ -161,16 +161,15 @@ def check_folder_for_otp_code(c: imaplib.IMAP4_SSL, folder: str, after_id: int =
             raw_bytes = b"".join(x[1] for x in data if isinstance(x, tuple))
             decoded = _decode_raw_message(raw_bytes)
 
-            if "aymo" in decoded.lower():
-                m = re.search(r'verification\s+code\s+is[\s\S]{0,100}?([0-9]{6})', decoded, re.I)
-                if not m:
-                    m = re.search(r'<strong[^>]*>([0-9]{6})</strong>', decoded, re.I)
-                if not m:
-                    m = re.search(r'\b([0-9]{6})\b', decoded)
+            if "aymo" in decoded.lower() or "verification" in decoded.lower() or "code" in decoded.lower():
+                m = re.search(r'(?:code is|verification code|is:?)\s*[:：]?\s*([0-9]{6})', decoded, re.I)
                 if m:
-                    return m.group(1)
-    except Exception as e:
-        logger.debug("check_folder_for_otp_code error in %s: %s", folder, e)
+                    return m.group(1).strip()
+                m2 = re.search(r'\b([0-9]{6})\b', decoded)
+                if m2:
+                    return m2.group(1).strip()
+    except Exception:
+        pass
     return None
 
 
@@ -180,9 +179,10 @@ def read_outlook_email_with_token(
     baseline_folders: dict[str, int] = None,
     mode: str = "link",
 ) -> str | None:
-    baseline = baseline_folders or {'"Junk"': 0, 'INBOX': 0}
+    """Connects via IMAP using XOAUTH2 and searches for verify-email link or OTP code."""
     hosts = [h.strip() for h in os.getenv("OUTLOOK_IMAP_HOSTS", "outlook.office365.com;imap-mail.outlook.com").replace(",", ";").split(";") if h.strip()]
     port = int(os.getenv("OUTLOOK_IMAP_PORT", "993"))
+    baseline = baseline_folders or {'"Junk"': 0, 'INBOX': 0}
 
     for host in hosts:
         c = None
@@ -193,13 +193,15 @@ def read_outlook_email_with_token(
             if typ != "OK":
                 continue
 
-            for folder in ["INBOX", '"Junk"']:
-                if mode == "link":
-                    val = check_folder_for_verify_link(c, folder, baseline.get(folder, 0))
+            for folder in ['"Junk"', 'INBOX']:
+                after_id = baseline.get(folder, 0)
+                if mode == "otp":
+                    val = check_folder_for_otp_code(c, folder, after_id)
                 else:
-                    val = check_folder_for_otp_code(c, folder, baseline.get(folder, 0))
+                    val = check_folder_for_verify_link(c, folder, after_id)
                 if val:
                     return val
+
             return None
         except Exception:
             pass
@@ -272,21 +274,31 @@ class OutlookEmailService:
     def __init__(self, account_file: str = None):
         self.path = account_file or os.getenv("OUTLOOK_ACCOUNT_FILE", "outlook_live_20261018_222014.txt")
         self.accounts: list[dict[str, str]] = []
+        self._accounts_by_email: dict[str, dict[str, str]] = {}
         self._load_accounts()
 
     def _load_accounts(self):
         self.accounts = []
+        self._accounts_by_email = {}
         if os.path.exists(self.path):
             with open(self.path, encoding="utf-8-sig") as f:
                 for line in f:
                     parts = line.strip().split("----")
                     if len(parts) >= 4:
-                        self.accounts.append({
+                        item = {
                             "email": parts[0].strip(),
                             "password": parts[1].strip(),
                             "client_id": parts[2].strip(),
                             "refresh_token": parts[3].strip(),
-                        })
+                        }
+                        self.accounts.append(item)
+                        self._accounts_by_email[item["email"].lower()] = item
+
+    def get_account_by_email(self, email_addr: str) -> dict[str, str] | None:
+        """Look up Outlook credentials by email address."""
+        if not email_addr:
+            return None
+        return self._accounts_by_email.get(email_addr.strip().lower())
 
     def get_used_status(self) -> dict:
         if STATUS_FILE.exists():
@@ -311,14 +323,65 @@ class OutlookEmailService:
         }
         self.save_used_status(data)
 
+    @staticmethod
+    def is_transient_error(err: str) -> bool:
+        """Determines if an error is transient (solver offline, network timeout, 429) rather than fatal."""
+        if not err:
+            return True
+        err_lower = err.lower()
+        transient_keywords = (
+            "turnstile", "captcha", "solver", "timeout", "timed out",
+            "connect", "connection", "remotedisconnected", "proxy",
+            "429", "rate limit", "500", "502", "503", "504",
+            "temporary", "reset by peer", "ssl", "gateway", "超时", "解析失败", "未能在限定时间", "验证码", "网络", "掉线", "无法获取", "临时"
+        )
+        return any(k in err_lower for k in transient_keywords)
+
+    def clean_and_recover_status(self) -> dict[str, int]:
+        """Scans status file and clears false-positive 'failed' statuses (e.g. from solver offline)."""
+        data = self.get_used_status()
+        used = data.get("used", {})
+        recovered = 0
+        converted_already_reg = 0
+        to_delete = []
+
+        for email, info in used.items():
+            st = info.get("status")
+            err = str(info.get("error", ""))
+            if st == "failed":
+                if "EMAIL_ALREADY_EXISTS" in err or "already exists" in err.lower():
+                    info["status"] = "already_registered"
+                    converted_already_reg += 1
+                elif self.is_transient_error(err):
+                    to_delete.append(email)
+                    recovered += 1
+
+        for email in to_delete:
+            del used[email]
+
+        if recovered or converted_already_reg:
+            self.save_used_status(data)
+            logger.info(
+                "Cleaned outlook_usage.json: %d accounts recovered from transient failure, %d updated to already_registered",
+                recovered, converted_already_reg
+            )
+        return {"recovered": recovered, "converted": converted_already_reg}
+
     def get_candidate_accounts(self, count: int = 10, exclude_emails: set[str] = None) -> list[dict[str, str]]:
+        """Returns available candidate accounts, excluding permanently consumed or broken accounts."""
         used_dict = self.get_used_status().get("used", {})
-        permanently_used = {
-            email.lower()
-            for email, info in used_dict.items()
-            if info.get("status") in ("registered", "already_registered")
-            or (info.get("status") == "failed" and "429" not in str(info.get("error", "")))
-        }
+        permanently_used = set()
+        for email, info in used_dict.items():
+            status = info.get("status")
+            err = str(info.get("error", ""))
+            # If registered or already_registered on Aymo, it's not a candidate for fresh sign-up
+            if status == "registered":
+                permanently_used.add(email.lower())
+            elif status == "failed":
+                # If error was NOT transient (e.g. invalid Microsoft OAuth grant, disabled mailbox), mark as unusable
+                if not self.is_transient_error(err) and ("already exists" not in err.lower()):
+                    permanently_used.add(email.lower())
+
         excluded = {e.lower() for e in (set(exclude_emails or set()) | permanently_used)}
         candidates = []
         for acc in self.accounts:

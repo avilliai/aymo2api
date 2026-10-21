@@ -435,7 +435,13 @@ async def register_outlook_account(
             body_snippet = resp.text[:300]
             if resp.status_code == 422 and ("EMAIL_ALREADY_EXISTS" in body_snippet or "already exists" in body_snippet.lower()):
                 logger.info("[%s] 邮箱已在 Aymo 注册 (EMAIL_ALREADY_EXISTS)，直接执行登录流程...", email)
-                return await sign_in_outlook_account(record, proxy=proxy)
+                acc = await sign_in_outlook_account(record, proxy=proxy)
+                OutlookEmailService().mark_email_used(
+                    email,
+                    status="registered",
+                    extra={"user_id": acc.get("user_id"), "org_id": acc.get("org_id"), "registered_at": int(time.time())},
+                )
+                return acc
             raise RegistrationError(f"注册请求失败 HTTP {resp.status_code}: {body_snippet}")
 
         user_id = ""
@@ -534,31 +540,65 @@ async def register_batch_outlook(count: int = 10, concurrency: int = 1) -> list[
         existing_emails = {entry["email"].lower() for entry in token_manager.tokens if entry.get("email")}
         candidates = svc.get_candidate_accounts(count=count - len(registered), exclude_emails=existing_emails)
         if not candidates:
-            logger.info("所有可用 Outlook 邮箱已注册使用完毕，切换为现有账号池轮询模式。")
+            logger.info("所有可用 Outlook 邮箱已注册使用完毕，切换为已有账号池轮询模式。")
             break
 
+        used_status = svc.get_used_status().get("used", {})
         for rec in candidates:
             if len(registered) >= count:
                 break
             email = rec["email"]
-            logger.info("处理 Outlook 账号 (%d/%d): %s ...", len(registered) + 1, count, email)
+            is_already_reg = used_status.get(email.lower(), {}).get("status") == "already_registered"
+            logger.info("处理 Outlook 账号 (%d/%d): %s (已知已注册: %s) ...", len(registered) + 1, count, email, is_already_reg)
             try:
-                account = await register_outlook_account(rec, proxy=proxy)
+                if is_already_reg:
+                    logger.info("[%s] 属于已注册账号，直接走邮箱 OTP 登录流程恢复并加入活跃池...", email)
+                    account = await sign_in_outlook_account(rec, proxy=proxy)
+                    svc.mark_email_used(email, status="registered", extra={"user_id": account.get("user_id"), "org_id": account.get("org_id")})
+                else:
+                    account = await register_outlook_account(rec, proxy=proxy)
                 await token_manager.add([account], probe=False)
                 registered.append(account)
                 logger.info("Outlook 账号 %s 成功加入活跃池，当前额度：%d (新增进度: %d/%d)", email, account.get("credits", 0), len(registered), count)
                 await asyncio.sleep(2)
             except Exception as exc:
                 err_msg = str(exc)
-                logger.error("Outlook 账号 %s 注册/登录失败: %s", email, err_msg)
-                if "429" in err_msg:
-                    logger.warning("遇到 429 频率限制，等待 15 秒后重试下一候选账号...")
+                logger.warning("Outlook 账号 %s 注册/登录异常: %s", email, err_msg)
+                
+                # Case 1: 邮箱已存在 -> 尝试直接邮箱登录恢复
+                if "EMAIL_ALREADY_EXISTS" in err_msg or "already exists" in err_msg.lower():
+                    logger.info("[%s] 邮箱已在 Aymo 注册过，尝试通过邮箱 OTP 登录接入活跃池...", email)
+                    try:
+                        account = await sign_in_outlook_account(rec, proxy=proxy)
+                        await token_manager.add([account], probe=False)
+                        registered.append(account)
+                        logger.info("已注册 Outlook 账号 %s 成功恢复并加入活跃池，额度：%d", email, account.get("credits", 0))
+                        continue
+                    except Exception as signin_exc:
+                        logger.warning("[%s] 已注册邮箱暂无法完成重登: %s", email, signin_exc)
+                        svc.mark_email_used(email, status="already_registered", extra={"error": str(signin_exc)})
+                        await asyncio.sleep(2)
+                        continue
+
+                # Case 2: 429 频率限制
+                if "429" in err_msg or "rate limit" in err_msg.lower():
+                    logger.warning("遇到 429 频率限制，等待 15 秒后重试下一候选账号（保留本邮箱）...")
                     await asyncio.sleep(15)
-                else:
-                    svc.mark_email_used(email, status="failed", extra={"error": err_msg})
-                    await asyncio.sleep(2)
+                    continue
+
+                # Case 3: Turnstile solver 掉线或网络超时等临时故障 -> 绝对不标记为永久废弃！
+                if svc.is_transient_error(err_msg):
+                    logger.warning("[%s] 遇到外部服务/验证码求解临时故障，保留该候选账号以便恢复后重新使用", email)
+                    await asyncio.sleep(3)
+                    continue
+
+                # Case 4: 真正的永久凭证损坏（如微软 OAuth invalid_grant）
+                logger.error("Outlook 账号 %s 永久失效: %s", email, err_msg)
+                svc.mark_email_used(email, status="failed", extra={"error": err_msg})
+                await asyncio.sleep(2)
 
     return registered
+
 
 class RegistrationService:
     def __init__(self) -> None:
